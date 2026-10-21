@@ -13,13 +13,20 @@ from utils.dc_utils import save_video
 import utils.dc_utils
 utils.dc_utils.DECORD_AVAILABLE = False
 
-# Native PyTorch SDPA Patch for Attention to bypass brittle xformers
+# Kill xformers globally in ALL modules that import it, before any model is loaded.
+# Each module has its own XFORMERS_AVAILABLE flag — every one must be forced False.
 import torch.nn.functional as F
 import video_depth_anything.dinov2_layers.attention as dinov2_attn
+import video_depth_anything.dinov2_layers.block as dinov2_block
+import video_depth_anything.dinov2_layers.swiglu_ffn as dinov2_swiglu
 import video_depth_anything.motion_module.attention as motion_attn
+import video_depth_anything.motion_module.motion_module as motion_mod
 
 dinov2_attn.XFORMERS_AVAILABLE = False
+dinov2_block.XFORMERS_AVAILABLE = False
+dinov2_swiglu.XFORMERS_AVAILABLE = False
 motion_attn.XFORMERS_AVAILABLE = False
+motion_mod.XFORMERS_AVAILABLE = False
 
 def patched_mem_eff_forward(self, x: torch.Tensor, attn_bias=None) -> torch.Tensor:
     B, N, C = x.shape
@@ -37,6 +44,17 @@ def patched_mem_eff_forward(self, x: torch.Tensor, attn_bias=None) -> torch.Tens
     return out
 
 dinov2_attn.MemEffAttention.forward = patched_mem_eff_forward
+
+# Also force-disable the per-instance flag in the motion module's temporal attention.
+# motion_module.py line 222 sets self._use_memory_efficient_attention_xformers = True at init.
+# We patch __init__ of VersatileAttention to force it False after construction.
+_orig_versatile_init = motion_mod.VersatileAttention.__init__
+
+def _patched_versatile_init(self, *args, **kwargs):
+    _orig_versatile_init(self, *args, **kwargs)
+    self._use_memory_efficient_attention_xformers = False
+
+motion_mod.VersatileAttention.__init__ = _patched_versatile_init
 
 MODEL_CONFIGS = {
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},

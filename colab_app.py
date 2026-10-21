@@ -46,15 +46,14 @@ def patched_mem_eff_forward(self, x: torch.Tensor, attn_bias=None) -> torch.Tens
 dinov2_attn.MemEffAttention.forward = patched_mem_eff_forward
 
 # Also force-disable the per-instance flag in the motion module's temporal attention.
-# motion_module.py line 222 sets self._use_memory_efficient_attention_xformers = True at init.
-# We patch __init__ of VersatileAttention to force it False after construction.
-_orig_versatile_init = motion_mod.VersatileAttention.__init__
+# motion_module.py sets self._use_memory_efficient_attention_xformers = True at init for TemporalAttention.
+_orig_temporal_init = motion_mod.TemporalAttention.__init__
 
-def _patched_versatile_init(self, *args, **kwargs):
-    _orig_versatile_init(self, *args, **kwargs)
+def _patched_temporal_init(self, *args, **kwargs):
+    _orig_temporal_init(self, *args, **kwargs)
     self._use_memory_efficient_attention_xformers = False
 
-motion_mod.VersatileAttention.__init__ = _patched_versatile_init
+motion_mod.TemporalAttention.__init__ = _patched_temporal_init
 
 MODEL_CONFIGS = {
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},

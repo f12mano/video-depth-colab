@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints & weights
+*.pth
+*.pt
+*.onnx
+checkpoints/
+
+# Outputs & temporary media
+outputs/
+*.mp4
+*.zip
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Jupyter Checkpoints
+.ipynb_checkpoints/
+
+# OS artifacts
+.DS_Store
+Thumbs.db

@@ -83,7 +83,7 @@ def infer_video_depth(
     progress(0.25, desc="Decoding and resizing video frames...")
     frames, computed_fps = read_video_frames(
         input_video,
-        max_len=max_len,
+        process_length=max_len,
         target_fps=target_fps,
         max_res=max_res,
     )

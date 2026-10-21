@@ -13,6 +13,31 @@ from utils.dc_utils import save_video
 import utils.dc_utils
 utils.dc_utils.DECORD_AVAILABLE = False
 
+# Native PyTorch SDPA Patch for Attention to bypass brittle xformers
+import torch.nn.functional as F
+import video_depth_anything.dinov2_layers.attention as dinov2_attn
+import video_depth_anything.motion_module.attention as motion_attn
+
+dinov2_attn.XFORMERS_AVAILABLE = False
+motion_attn.XFORMERS_AVAILABLE = False
+
+def patched_mem_eff_forward(self, x: torch.Tensor, attn_bias=None) -> torch.Tensor:
+    B, N, C = x.shape
+    qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+    qkv = qkv.permute(2, 0, 3, 1, 4)
+    q, k, v = qkv[0], qkv[1], qkv[2]
+
+    # Native PyTorch SDPA is memory-efficient and automatically selects the fastest backend
+    out = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_bias, dropout_p=self.attn_drop.p if self.training else 0.0, scale=self.scale
+    )
+    out = out.transpose(1, 2).reshape(B, N, C)
+    out = self.proj(out)
+    out = self.proj_drop(out)
+    return out
+
+dinov2_attn.MemEffAttention.forward = patched_mem_eff_forward
+
 MODEL_CONFIGS = {
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
     'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},

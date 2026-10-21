@@ -2,10 +2,16 @@
 # Adapted for Google Colab Cloud Deployment with Free T4 GPU & Gradio Share
 import os
 import gc
+import cv2
+import numpy as np
 import torch
 import gradio as gr
 from video_depth_anything.video_depth import VideoDepthAnything
-from utils.dc_utils import read_video_frames, save_video
+from utils.dc_utils import save_video
+
+# Explicitly disable decord in dc_utils to prevent C++ threaded_decoder.cc assertions
+import utils.dc_utils
+utils.dc_utils.DECORD_AVAILABLE = False
 
 MODEL_CONFIGS = {
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -24,6 +30,66 @@ HF_WEIGHT_URLS = {
 
 current_model = None
 current_encoder = None
+
+def ensure_even(value: int) -> int:
+    return value if value % 2 == 0 else value + 1
+
+def read_video_frames_robust(video_path: str, process_length: int = -1, target_fps: int = -1, max_res: int = -1):
+    """
+    Robust video reader using OpenCV cv2.VideoCapture.
+    Bypasses decord's C++ avcodec_send_packet threaded_decoder assertion crashes
+    on variable-framerate, mobile, or web-downloaded MP4 files.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {video_path}")
+
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    if original_fps <= 0 or np.isnan(original_fps):
+        original_fps = 25.0
+
+    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+
+    target_height = ensure_even(original_height)
+    target_width = ensure_even(original_width)
+
+    if max_res > 0 and max(original_height, original_width) > max_res:
+        scale = max_res / max(original_height, original_width)
+        target_height = ensure_even(round(original_height * scale))
+        target_width = ensure_even(round(original_width * scale))
+
+    fps = original_fps if target_fps <= 0 else target_fps
+    stride = max(round(original_fps / fps), 1)
+
+    frames = []
+    frame_idx = 0
+    collected_count = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % stride == 0:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if frame.shape[0] != target_height or frame.shape[1] != target_width:
+                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
+            frames.append(frame)
+            collected_count += 1
+
+            if process_length > 0 and collected_count >= process_length:
+                break
+
+        frame_idx += 1
+
+    cap.release()
+
+    if len(frames) == 0:
+        raise ValueError(f"No frames could be extracted from: {video_path}")
+
+    frames_array = np.stack(frames, axis=0)
+    return frames_array, int(round(fps))
 
 def get_or_load_model(encoder: str = 'vits', device: str = 'cuda'):
     global current_model, current_encoder
@@ -80,8 +146,8 @@ def infer_video_depth(
     processed_video_path = os.path.join(output_dir, f"{base_name}_src.mp4")
     depth_vis_path = os.path.join(output_dir, f"{base_name}_depth.mp4")
 
-    progress(0.25, desc="Decoding and resizing video frames...")
-    frames, computed_fps = read_video_frames(
+    progress(0.25, desc="Decoding and resizing video frames safely with OpenCV...")
+    frames, computed_fps = read_video_frames_robust(
         input_video,
         process_length=max_len,
         target_fps=target_fps,
@@ -97,7 +163,7 @@ def infer_video_depth(
             device=device,
         )
 
-    progress(0.85, desc="Encoding output videos...")
+    progress(0.85, desc="Encoding output depth video...")
     save_video(frames, processed_video_path, fps=out_fps)
     save_video(depths, depth_vis_path, fps=out_fps, is_depths=True, grayscale=grayscale)
 

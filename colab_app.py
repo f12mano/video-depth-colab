@@ -96,10 +96,11 @@ def get_sam2_predictor(device: str = "cuda"):
     sam2_predictor = build_sam2_video_predictor_hf("facebook/sam2.1-hiera-tiny", device=device)
     return sam2_predictor
 
-def run_sam2_video_segmentation(frames_rgb: np.ndarray, device: str = "cuda") -> list:
+def run_sam2_video_segmentation(frames_rgb: np.ndarray, num_subjects: int = 1, device: str = "cuda") -> list:
     """
-    Runs Meta's official SAM 2.1 to isolate subject + money bundle frame-by-frame.
-    Returns a list of boolean 2D masks (True = Subject/Money, False = Background).
+    Runs Meta's official SAM 2.1 to isolate subject(s) frame-by-frame.
+    Supports 1 person (centered) or 2 persons (left & right duo).
+    Returns a list of boolean 2D masks (True = Subject, False = Background).
     """
     predictor = get_sam2_predictor(device=device)
     temp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
@@ -111,33 +112,71 @@ def run_sam2_video_segmentation(frames_rgb: np.ndarray, device: str = "cuda") ->
             state = predictor.init_state(video_path=temp_dir)
             H, W = frames_rgb[0].shape[:2]
 
-            # 4 Key Points on frame 0 to lock subject head, torso, and money fan
-            points = np.array([
-                [int(W * 0.50), int(H * 0.30)],  # Face/chin area
-                [int(W * 0.50), int(H * 0.65)],  # Center money bundle
-                [int(W * 0.35), int(H * 0.70)],  # Left money fan / hand
-                [int(W * 0.65), int(H * 0.70)],  # Right money fan / hand
-            ], dtype=np.float32)
-            labels = np.array([1, 1, 1, 1], dtype=np.int32)
+            if num_subjects == 1:
+                # 4 Key Points on frame 0 to lock centered subject head, torso, and hands
+                points = np.array([
+                    [int(W * 0.50), int(H * 0.30)],  # Face/chin area
+                    [int(W * 0.50), int(H * 0.65)],  # Center money/torso
+                    [int(W * 0.35), int(H * 0.70)],  # Left hand / bundle
+                    [int(W * 0.65), int(H * 0.70)],  # Right hand / bundle
+                ], dtype=np.float32)
+                labels = np.array([1, 1, 1, 1], dtype=np.int32)
+                predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=0,
+                    obj_id=1,
+                    points=points,
+                    labels=labels,
+                )
+            else:
+                # 2 Persons Duo (Side-by-side): prompt left subject and right subject separately
+                # Person 1 (Left): head, chest, torso, lower body
+                p1 = np.array([
+                    [int(W * 0.30), int(H * 0.28)],
+                    [int(W * 0.30), int(H * 0.55)],
+                    [int(W * 0.25), int(H * 0.75)],
+                    [int(W * 0.35), int(H * 0.75)],
+                ], dtype=np.float32)
+                l1 = np.array([1, 1, 1, 1], dtype=np.int32)
+                predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=0,
+                    obj_id=1,
+                    points=p1,
+                    labels=l1,
+                )
 
-            predictor.add_new_points_or_box(
-                inference_state=state,
-                frame_idx=0,
-                obj_id=1,
-                points=points,
-                labels=labels,
-            )
+                # Person 2 (Right): head, chest, torso, lower body
+                p2 = np.array([
+                    [int(W * 0.78), int(H * 0.28)],
+                    [int(W * 0.78), int(H * 0.55)],
+                    [int(W * 0.72), int(H * 0.75)],
+                    [int(W * 0.82), int(H * 0.75)],
+                ], dtype=np.float32)
+                l2 = np.array([1, 1, 1, 1], dtype=np.int32)
+                predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=0,
+                    obj_id=2,
+                    points=p2,
+                    labels=l2,
+                )
 
             masks = {}
             for frame_idx, obj_ids, video_res_masks in predictor.propagate_in_video(state):
-                mask = (video_res_masks[0] > 0.0).cpu().numpy().squeeze()
-                masks[frame_idx] = mask
+                # video_res_masks shape: (num_objs, 1, H, W)
+                # Combine all tracked subject masks via logical OR
+                if isinstance(video_res_masks, torch.Tensor):
+                    combined_mask = (video_res_masks > 0.0).any(dim=0).cpu().numpy().squeeze()
+                else:
+                    combined_mask = (video_res_masks > 0.0).any(axis=0).squeeze()
+                masks[frame_idx] = combined_mask
 
             return [masks[i] for i in range(len(frames_rgb))]
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-def apply_face_mesh_overlay(frames_rgb: np.ndarray, fps: int = 24) -> np.ndarray:
+def apply_face_mesh_overlay(frames_rgb: np.ndarray, fps: int = 24, num_faces: int = 4) -> np.ndarray:
     model_path = ensure_face_landmarker_model()
     BaseOptions = mp.tasks.BaseOptions
     FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -148,7 +187,7 @@ def apply_face_mesh_overlay(frames_rgb: np.ndarray, fps: int = 24) -> np.ndarray
     options = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=RunningMode.VIDEO,
-        num_faces=1,
+        num_faces=num_faces,
         min_face_detection_confidence=0.15,
         min_face_presence_confidence=0.15,
         min_tracking_confidence=0.15,
@@ -159,17 +198,16 @@ def apply_face_mesh_overlay(frames_rgb: np.ndarray, fps: int = 24) -> np.ndarray
         for i, frame in enumerate(frames_rgb):
             im = Image.fromarray(frame)
             w, h = im.size
-            x0 = int(w * 0.15); y0 = 0; cw = int(w * 0.70); ch = int(h * 0.70)
-            crop = im.crop((x0, y0, x0 + cw, y0 + ch))
 
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(crop))
+            # Full-frame detection without boundary clipping for multiple faces
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
             timestamp_ms = round(i * 1000 / max(fps, 1))
             result = detector.detect_for_video(mp_image, timestamp_ms)
 
             draw = ImageDraw.Draw(im)
             if result.face_landmarks:
                 for face in result.face_landmarks:
-                    pts = [(round(x0 + l.x * cw), round(y0 + l.y * ch)) for l in face]
+                    pts = [(round(l.x * w), round(l.y * h)) for l in face]
                     for conn in Connections.FACE_LANDMARKS_TESSELATION:
                         draw.line([pts[conn.start], pts[conn.end]], fill=(50, 170, 205), width=1)
                     for conn in Connections.FACE_LANDMARKS_LIPS:
@@ -268,6 +306,7 @@ def get_or_load_model(encoder: str = 'vits', device: str = 'cuda'):
 def infer_guidance_pipeline(
     input_video: str,
     pipeline_mode: str = "Sirio Exact (SAM 2.1 Depth Subject over Real Room + Face Mesh)",
+    subject_count: str = "1 Person (Centered)",
     encoder_choice: str = 'vits (Small - Fast & Safe for T4)',
     target_fps: int = 24,
     max_res: int = 960,
@@ -280,6 +319,7 @@ def infer_guidance_pipeline(
 
     encoder = 'vits' if 'vits' in encoder_choice.lower() else 'vitl'
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    num_subs = 2 if "2" in subject_count else 1
 
     output_dir = './outputs'
     os.makedirs(output_dir, exist_ok=True)
@@ -299,7 +339,7 @@ def infer_guidance_pipeline(
     # Mode A: Fast Face Mesh Only
     if pipeline_mode == "Fast (Face Mesh Only)":
         progress(0.4, desc="Tracking facial landmarks & drawing Face Mesh...")
-        mesh_frames = apply_face_mesh_overlay(frames, fps=computed_fps)
+        mesh_frames = apply_face_mesh_overlay(frames, fps=computed_fps, num_faces=4)
         progress(0.9, desc="Encoding Face Mesh preview video...")
         save_video(mesh_frames, guidance_video_path, fps=computed_fps)
         return [guidance_video_path, guidance_video_path]
@@ -342,14 +382,13 @@ def infer_guidance_pipeline(
 
     # Mode B: Sirio Exact (SAM 2.1 Video Masking + Depth Subject over Real Background)
     if "Sirio Exact" in pipeline_mode:
-        progress(0.65, desc="Running Meta SAM 2.1 Tiny to segment subject + money...")
-        masks = run_sam2_video_segmentation(frames, device=device)
+        progress(0.65, desc=f"Running Meta SAM 2.1 Tiny to segment {num_subs} subject(s)...")
+        masks = run_sam2_video_segmentation(frames, num_subjects=num_subs, device=device)
 
-        progress(0.80, desc="Compositing Depth subject over authentic room background...")
+        progress(0.80, desc="Compositing Depth subject(s) over authentic room background...")
         base_frames = []
         for i in range(len(frames)):
             m = masks[i]
-            # Ensure mask matches frame resolution
             if m.shape[:2] != frames[i].shape[:2]:
                 m = cv2.resize(m.astype(np.uint8), (frames[i].shape[1], frames[i].shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
             alpha = m[:, :, None]
@@ -361,8 +400,8 @@ def infer_guidance_pipeline(
         # Full frame depth as base
         base_frames_arr = depth_frames_arr
 
-    # Step 2: Overlay MediaPipe Face Mesh on top of Composite
-    progress(0.88, desc="Overlaying MediaPipe Face Mesh landmarks...")
+    # Step 2: Overlay MediaPipe Face Mesh on top of Composite (Full Frame, Multi-Face)
+    progress(0.88, desc="Overlaying MediaPipe Face Mesh landmarks on all detected faces...")
     model_path = ensure_face_landmarker_model()
     BaseOptions = mp.tasks.BaseOptions
     FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -373,7 +412,7 @@ def infer_guidance_pipeline(
     options = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=RunningMode.VIDEO,
-        num_faces=1,
+        num_faces=4,  # Detect up to 4 faces concurrently
         min_face_detection_confidence=0.15,
         min_face_presence_confidence=0.15,
         min_tracking_confidence=0.15,
@@ -382,12 +421,11 @@ def infer_guidance_pipeline(
     final_frames = []
     with FaceLandmarker.create_from_options(options) as detector:
         for i in range(len(frames)):
-            orig_im = Image.fromarray(frames[i])
-            w, h = orig_im.size
-            x0 = int(w * 0.15); y0 = 0; cw = int(w * 0.70); ch = int(h * 0.70)
-            crop = orig_im.crop((x0, y0, x0 + cw, y0 + ch))
+            orig_frame = frames[i]
+            h, w = orig_frame.shape[:2]
 
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(crop))
+            # Pass full frame to detect all faces without crop clipping
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=orig_frame)
             timestamp_ms = round(i * 1000 / max(out_fps, 1))
             result = detector.detect_for_video(mp_image, timestamp_ms)
 
@@ -395,7 +433,7 @@ def infer_guidance_pipeline(
             draw = ImageDraw.Draw(target_im)
             if result.face_landmarks:
                 for face in result.face_landmarks:
-                    pts = [(round(x0 + l.x * cw), round(y0 + l.y * ch)) for l in face]
+                    pts = [(round(l.x * w), round(l.y * h)) for l in face]
                     for conn in Connections.FACE_LANDMARKS_TESSELATION:
                         draw.line([pts[conn.start], pts[conn.end]], fill=(50, 170, 205), width=1)
                     for conn in Connections.FACE_LANDMARKS_LIPS:
@@ -434,7 +472,7 @@ def create_ui():
 
         with gr.Row():
             with gr.Column(scale=1):
-                input_video = gr.Video(label="Input Source Video (e.g. Woman Video)", sources=["upload"])
+                input_video = gr.Video(label="Input Source Video (e.g. Woman or Duo Video)", sources=["upload"])
 
                 pipeline_mode = gr.Radio(
                     choices=[
@@ -446,6 +484,16 @@ def create_ui():
                     value="Sirio Exact (SAM 2.1 Depth Subject over Real Room + Face Mesh)",
                     label="Guidance Pipeline Mode",
                     info="Sirio Exact isolates the subject/money via SAM 2.1 over the real bedroom background.",
+                )
+
+                subject_count = gr.Radio(
+                    choices=[
+                        "1 Person (Centered)",
+                        "2 Persons (Duo / Side-by-Side)"
+                    ],
+                    value="1 Person (Centered)",
+                    label="Subject Count in Video",
+                    info="Choose '2 Persons' if the clip features two people side-by-side so SAM 2 and Face Mesh lock onto both simultaneously.",
                 )
 
                 with gr.Accordion("Advanced Model & Duration Controls", open=True):
@@ -479,7 +527,7 @@ def create_ui():
 
         generate_btn.click(
             fn=infer_guidance_pipeline,
-            inputs=[input_video, pipeline_mode, encoder_choice, target_fps, max_res, max_len, grayscale],
+            inputs=[input_video, pipeline_mode, subject_count, encoder_choice, target_fps, max_res, max_len, grayscale],
             outputs=[guidance_video, depth_preview],
         )
 

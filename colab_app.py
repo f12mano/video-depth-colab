@@ -3,6 +3,8 @@
 import os
 import gc
 import cv2
+import shutil
+import tempfile
 import urllib.request
 import numpy as np
 import torch
@@ -17,7 +19,6 @@ import utils.dc_utils
 utils.dc_utils.DECORD_AVAILABLE = False
 
 # Kill xformers globally in ALL modules that import it, before any model is loaded.
-# Each module has its own XFORMERS_AVAILABLE flag — every one must be forced False.
 import torch.nn.functional as F
 import video_depth_anything.dinov2_layers.attention as dinov2_attn
 import video_depth_anything.dinov2_layers.block as dinov2_block
@@ -37,7 +38,6 @@ def patched_mem_eff_forward(self, x: torch.Tensor, attn_bias=None) -> torch.Tens
     qkv = qkv.permute(2, 0, 3, 1, 4)
     q, k, v = qkv[0], qkv[1], qkv[2]
 
-    # Native PyTorch SDPA is memory-efficient and automatically selects the fastest backend
     out = F.scaled_dot_product_attention(
         q, k, v, attn_mask=attn_bias, dropout_p=self.attn_drop.p if self.training else 0.0, scale=self.scale
     )
@@ -48,7 +48,6 @@ def patched_mem_eff_forward(self, x: torch.Tensor, attn_bias=None) -> torch.Tens
 
 dinov2_attn.MemEffAttention.forward = patched_mem_eff_forward
 
-# Force-disable the per-instance flag in the motion module's temporal attention.
 _orig_temporal_init = motion_mod.TemporalAttention.__init__
 
 def _patched_temporal_init(self, *args, **kwargs):
@@ -74,12 +73,12 @@ HF_WEIGHT_URLS = {
 
 current_model = None
 current_encoder = None
+sam2_predictor = None
 
 def ensure_even(value: int) -> int:
     return value if value % 2 == 0 else value + 1
 
 def ensure_face_landmarker_model() -> str:
-    """Downloads Google MediaPipe Face Landmarker model if not cached."""
     os.makedirs('./models', exist_ok=True)
     model_path = './models/face_landmarker.task'
     if not os.path.exists(model_path):
@@ -88,11 +87,57 @@ def ensure_face_landmarker_model() -> str:
         urllib.request.urlretrieve(url, model_path)
     return model_path
 
+def get_sam2_predictor(device: str = "cuda"):
+    global sam2_predictor
+    if sam2_predictor is not None:
+        return sam2_predictor
+    print("[+] Building Meta SAM 2.1 Tiny video predictor from HuggingFace...")
+    from sam2.build_sam import build_sam2_video_predictor_hf
+    sam2_predictor = build_sam2_video_predictor_hf("facebook/sam2.1-hiera-tiny", device=device)
+    return sam2_predictor
+
+def run_sam2_video_segmentation(frames_rgb: np.ndarray, device: str = "cuda") -> list:
+    """
+    Runs Meta's official SAM 2.1 to isolate subject + money bundle frame-by-frame.
+    Returns a list of boolean 2D masks (True = Subject/Money, False = Background).
+    """
+    predictor = get_sam2_predictor(device=device)
+    temp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
+    try:
+        for i, f in enumerate(frames_rgb):
+            cv2.imwrite(os.path.join(temp_dir, f"{i:05d}.jpg"), cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+
+        with torch.inference_mode():
+            state = predictor.init_state(video_path=temp_dir)
+            H, W = frames_rgb[0].shape[:2]
+
+            # 4 Key Points on frame 0 to lock subject head, torso, and money fan
+            points = np.array([
+                [int(W * 0.50), int(H * 0.30)],  # Face/chin area
+                [int(W * 0.50), int(H * 0.65)],  # Center money bundle
+                [int(W * 0.35), int(H * 0.70)],  # Left money fan / hand
+                [int(W * 0.65), int(H * 0.70)],  # Right money fan / hand
+            ], dtype=np.float32)
+            labels = np.array([1, 1, 1, 1], dtype=np.int32)
+
+            predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=0,
+                obj_id=1,
+                points=points,
+                labels=labels,
+            )
+
+            masks = {}
+            for frame_idx, obj_ids, video_res_masks in predictor.propagate_in_video(state):
+                mask = (video_res_masks[0] > 0.0).cpu().numpy().squeeze()
+                masks[frame_idx] = mask
+
+            return [masks[i] for i in range(len(frames_rgb))]
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 def apply_face_mesh_overlay(frames_rgb: np.ndarray, fps: int = 24) -> np.ndarray:
-    """
-    Overlays MediaPipe Face Mesh (tesselation in cyan, lips in orange, eyes in green)
-    directly onto frames_rgb (H, W, 3) in a unified, deterministic loop.
-    """
     model_path = ensure_face_landmarker_model()
     BaseOptions = mp.tasks.BaseOptions
     FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -114,12 +159,7 @@ def apply_face_mesh_overlay(frames_rgb: np.ndarray, fps: int = 24) -> np.ndarray
         for i, frame in enumerate(frames_rgb):
             im = Image.fromarray(frame)
             w, h = im.size
-
-            # Focused crop on upper body / head region for maximum landmark accuracy
-            x0 = int(w * 0.15)
-            y0 = 0
-            cw = int(w * 0.70)
-            ch = int(h * 0.70)
+            x0 = int(w * 0.15); y0 = 0; cw = int(w * 0.70); ch = int(h * 0.70)
             crop = im.crop((x0, y0, x0 + cw, y0 + ch))
 
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(crop))
@@ -130,16 +170,10 @@ def apply_face_mesh_overlay(frames_rgb: np.ndarray, fps: int = 24) -> np.ndarray
             if result.face_landmarks:
                 for face in result.face_landmarks:
                     pts = [(round(x0 + l.x * cw), round(y0 + l.y * ch)) for l in face]
-
-                    # Facial Tesselation Mesh (Cyan)
                     for conn in Connections.FACE_LANDMARKS_TESSELATION:
                         draw.line([pts[conn.start], pts[conn.end]], fill=(50, 170, 205), width=1)
-
-                    # Lips Highlight (Warm Orange)
                     for conn in Connections.FACE_LANDMARKS_LIPS:
                         draw.line([pts[conn.start], pts[conn.end]], fill=(255, 135, 100), width=2)
-
-                    # Left & Right Eyes (Lime Green)
                     for conn in Connections.FACE_LANDMARKS_LEFT_EYE:
                         draw.line([pts[conn.start], pts[conn.end]], fill=(130, 255, 150), width=2)
                     for conn in Connections.FACE_LANDMARKS_RIGHT_EYE:
@@ -233,11 +267,11 @@ def get_or_load_model(encoder: str = 'vits', device: str = 'cuda'):
 
 def infer_guidance_pipeline(
     input_video: str,
-    pipeline_mode: str = "Combined (Depth + Face Mesh Guidance)",
+    pipeline_mode: str = "Sirio Exact (SAM 2.1 Depth Subject over Real Room + Face Mesh)",
     encoder_choice: str = 'vits (Small - Fast & Safe for T4)',
     target_fps: int = 24,
     max_res: int = 960,
-    max_len: int = 96,  # Default to 4 seconds (96 frames @ 24fps) for deterministic PoC
+    max_len: int = 228,  # Exactly 9.5 seconds @ 24fps
     grayscale: bool = False,
     progress=gr.Progress(track_tqdm=True),
 ):
@@ -251,7 +285,7 @@ def infer_guidance_pipeline(
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(input_video))[0]
 
-    progress(0.1, desc="Reading and normalizing source video frames...")
+    progress(0.1, desc="Decoding and normalizing video frames...")
     frames, computed_fps = read_video_frames_robust(
         input_video,
         process_length=max_len,
@@ -262,7 +296,7 @@ def infer_guidance_pipeline(
     guidance_video_path = os.path.join(output_dir, f"{base_name}_guidance_preview.mp4")
     depth_only_path = os.path.join(output_dir, f"{base_name}_depth_only.mp4")
 
-    # Mode 1: Pure Face Mesh
+    # Mode A: Fast Face Mesh Only
     if pipeline_mode == "Fast (Face Mesh Only)":
         progress(0.4, desc="Tracking facial landmarks & drawing Face Mesh...")
         mesh_frames = apply_face_mesh_overlay(frames, fps=computed_fps)
@@ -270,11 +304,11 @@ def infer_guidance_pipeline(
         save_video(mesh_frames, guidance_video_path, fps=computed_fps)
         return [guidance_video_path, guidance_video_path]
 
-    # Model Inference for Depth
-    progress(0.3, desc=f"Loading {encoder} depth model...")
+    # Step 1: Run Depth Model
+    progress(0.25, desc=f"Loading {encoder} depth model...")
     model = get_or_load_model(encoder=encoder, device=device)
 
-    progress(0.5, desc="Computing high-consistency temporal depth...")
+    progress(0.45, desc="Computing consistent temporal depth...")
     with torch.no_grad():
         depths, out_fps = model.infer_video_depth(
             frames,
@@ -283,17 +317,20 @@ def infer_guidance_pipeline(
             device=device,
         )
 
-    # Render depth video to disk
     save_video(depths, depth_only_path, fps=out_fps, is_depths=True, grayscale=grayscale)
 
-    if pipeline_mode == "Depth Map Only":
+    # Free depth model memory to make room for SAM 2
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    if pipeline_mode == "Raw Depth Map Only":
         processed_video_path = os.path.join(output_dir, f"{base_name}_src.mp4")
         save_video(frames, processed_video_path, fps=out_fps)
         return [processed_video_path, depth_only_path]
 
-    # Mode 3: Combined (Depth + Face Mesh Guidance)
-    progress(0.8, desc="Compositing MediaPipe Face Mesh on top of Depth...")
-    # Read back the rendered depth frames to overlay face mesh
+    # Read rendered depth frames back as RGB arrays
     cap_d = cv2.VideoCapture(depth_only_path)
     depth_frames = []
     while cap_d.isOpened():
@@ -303,7 +340,29 @@ def infer_guidance_pipeline(
     cap_d.release()
     depth_frames_arr = np.stack(depth_frames, axis=0)
 
-    # Track face landmarks from original frames and draw them on depth frames
+    # Mode B: Sirio Exact (SAM 2.1 Video Masking + Depth Subject over Real Background)
+    if "Sirio Exact" in pipeline_mode:
+        progress(0.65, desc="Running Meta SAM 2.1 Tiny to segment subject + money...")
+        masks = run_sam2_video_segmentation(frames, device=device)
+
+        progress(0.80, desc="Compositing Depth subject over authentic room background...")
+        base_frames = []
+        for i in range(len(frames)):
+            m = masks[i]
+            # Ensure mask matches frame resolution
+            if m.shape[:2] != frames[i].shape[:2]:
+                m = cv2.resize(m.astype(np.uint8), (frames[i].shape[1], frames[i].shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+            alpha = m[:, :, None]
+            # Sirio's exact compositing formula: np.where(alpha, depth, original_rgb)
+            comp = np.where(alpha, depth_frames_arr[i], frames[i]).astype(np.uint8)
+            base_frames.append(comp)
+        base_frames_arr = np.stack(base_frames, axis=0)
+    else:
+        # Full frame depth as base
+        base_frames_arr = depth_frames_arr
+
+    # Step 2: Overlay MediaPipe Face Mesh on top of Composite
+    progress(0.88, desc="Overlaying MediaPipe Face Mesh landmarks...")
     model_path = ensure_face_landmarker_model()
     BaseOptions = mp.tasks.BaseOptions
     FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -320,23 +379,19 @@ def infer_guidance_pipeline(
         min_tracking_confidence=0.15,
     )
 
-    composite_frames = []
+    final_frames = []
     with FaceLandmarker.create_from_options(options) as detector:
         for i in range(len(frames)):
             orig_im = Image.fromarray(frames[i])
             w, h = orig_im.size
-            x0 = int(w * 0.15)
-            y0 = 0
-            cw = int(w * 0.70)
-            ch = int(h * 0.70)
+            x0 = int(w * 0.15); y0 = 0; cw = int(w * 0.70); ch = int(h * 0.70)
             crop = orig_im.crop((x0, y0, x0 + cw, y0 + ch))
 
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(crop))
             timestamp_ms = round(i * 1000 / max(out_fps, 1))
             result = detector.detect_for_video(mp_image, timestamp_ms)
 
-            # Draw onto the depth frame
-            target_im = Image.fromarray(depth_frames_arr[i])
+            target_im = Image.fromarray(base_frames_arr[i])
             draw = ImageDraw.Draw(target_im)
             if result.face_landmarks:
                 for face in result.face_landmarks:
@@ -350,10 +405,10 @@ def infer_guidance_pipeline(
                     for conn in Connections.FACE_LANDMARKS_RIGHT_EYE:
                         draw.line([pts[conn.start], pts[conn.end]], fill=(130, 255, 150), width=2)
 
-            composite_frames.append(np.array(target_im))
+            final_frames.append(np.array(target_im))
 
-    progress(0.95, desc="Saving final Composite Guidance MP4...")
-    save_video(np.stack(composite_frames, axis=0), guidance_video_path, fps=out_fps)
+    progress(0.98, desc="Encoding final Guidance MP4 video...")
+    save_video(np.stack(final_frames, axis=0), guidance_video_path, fps=out_fps)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -367,13 +422,13 @@ def create_ui():
     #generate-btn { background: #2563eb !important; color: white !important; font-size: 1.1rem; }
     """
 
-    with gr.Blocks(title="Genjutsu Video Guidance — Colab Studio", css=custom_css, analytics_enabled=False) as demo:
+    with gr.Blocks(title="Genjutsu Studio (SAM 2.1 + VDA + Mesh)", css=custom_css, analytics_enabled=False) as demo:
         with gr.Column(elem_id="title-container"):
             gr.Markdown(
                 """
-                # 🎭 Genjutsu Guidance Studio — Colab Cloud Runner
-                ### High-Consistency Video Depth & MediaPipe Face Mesh Compositor (Zero Time Limits)
-                Generate deterministic guidance videos for Omni / Seedance character replacement.
+                # 🎭 Genjutsu Guidance Studio — Meta SAM 2.1 Edition
+                ### Deterministic Subject Segmentation + Consistent Depth + MediaPipe Face Mesh
+                Exact reproduction of Sirio Berati's Genjutsu pipeline (Zero Cloud Cost).
                 """
             )
 
@@ -383,19 +438,20 @@ def create_ui():
 
                 pipeline_mode = gr.Radio(
                     choices=[
-                        "Combined (Depth + Face Mesh Guidance)",
+                        "Sirio Exact (SAM 2.1 Depth Subject over Real Room + Face Mesh)",
+                        "Combined (Full-frame Depth + Face Mesh)",
                         "Fast (Face Mesh Only)",
-                        "Depth Map Only"
+                        "Raw Depth Map Only"
                     ],
-                    value="Combined (Depth + Face Mesh Guidance)",
+                    value="Sirio Exact (SAM 2.1 Depth Subject over Real Room + Face Mesh)",
                     label="Guidance Pipeline Mode",
-                    info="Combined fuses body/money depth with facial mesh landmarks for 100% deterministic motion.",
+                    info="Sirio Exact isolates the subject/money via SAM 2.1 over the real bedroom background.",
                 )
 
                 with gr.Accordion("Advanced Model & Duration Controls", open=True):
                     max_len = gr.Slider(
-                        minimum=24, maximum=500, value=96, step=24,
-                        label="Frames to Process (96 frames = 4 seconds @ 24fps for PoC)",
+                        minimum=24, maximum=500, value=228, step=12,
+                        label="Frames to Process (228 frames = Exactly 9.5s @ 24fps)",
                     )
                     target_fps = gr.Slider(
                         minimum=12, maximum=30, value=24, step=1,

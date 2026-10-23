@@ -361,15 +361,23 @@ def infer_guidance_pipeline(
         max_res=max_res,
     )
 
+    # Paths for outputs and Frame 0 assets
     guidance_video_path = os.path.join(output_dir, f"{base_name}_guidance_preview.mp4")
     depth_only_path = os.path.join(output_dir, f"{base_name}_depth_only.mp4")
+    frame0_clean_path = os.path.join(output_dir, f"{base_name}_frame0_clean.jpg")
+    frame0_mesh_path = os.path.join(output_dir, f"{base_name}_frame0_mesh.jpg")
+
+    # Export Clean Frame 0
+    cv2.imwrite(frame0_clean_path, cv2.cvtColor(frames[0], cv2.COLOR_RGB2BGR))
 
     if pipeline_mode == "Fast (Face Mesh Only)":
         progress(0.4, desc="Tracking facial landmarks & drawing Face Mesh...")
         mesh_frames = apply_face_mesh_overlay(frames, fps=computed_fps, num_faces=4)
         progress(0.9, desc="Encoding Face Mesh preview video...")
         save_video_custom(mesh_frames, guidance_video_path, fps=computed_fps)
-        return [guidance_video_path, guidance_video_path]
+        # Export Mesh Frame 0 from mesh_frames
+        cv2.imwrite(frame0_mesh_path, cv2.cvtColor(mesh_frames[0], cv2.COLOR_RGB2BGR))
+        return [guidance_video_path, depth_only_path, frame0_clean_path, frame0_mesh_path]
 
     progress(0.25, desc=f"Loading {encoder} depth model...")
     model = get_or_load_model(encoder=encoder, device=device)
@@ -393,7 +401,7 @@ def infer_guidance_pipeline(
     if pipeline_mode == "Raw Depth Map Only":
         processed_video_path = os.path.join(output_dir, f"{base_name}_src.mp4")
         save_video_custom(frames, processed_video_path, fps=out_fps)
-        return [processed_video_path, depth_only_path]
+        return [processed_video_path, depth_only_path, frame0_clean_path, frame0_clean_path]
 
     cap_d = cv2.VideoCapture(depth_only_path)
     depth_frames = []
@@ -447,6 +455,12 @@ def infer_guidance_pipeline(
             draw_face_mesh_on_image(detector, orig_frame, target_im, timestamp_ms, Connections)
             final_frames.append(np.array(target_im))
 
+            # Export Mesh Frame 0 at index 0 from the original RGB frame with mesh overlay
+            if i == 0:
+                frame0_mesh_im = Image.fromarray(frames[0].copy())
+                draw_face_mesh_on_image(detector, orig_frame, frame0_mesh_im, 0, Connections)
+                frame0_mesh_im.save(frame0_mesh_path, quality=95)
+
     progress(0.98, desc="Encoding final Guidance MP4 video...")
     save_video_custom(np.stack(final_frames, axis=0), guidance_video_path, fps=out_fps)
 
@@ -454,7 +468,7 @@ def infer_guidance_pipeline(
         torch.cuda.empty_cache()
 
     progress(1.0, desc="Done!")
-    return [guidance_video_path, depth_only_path]
+    return [guidance_video_path, depth_only_path, frame0_clean_path, frame0_mesh_path]
 
 def create_ui():
     custom_css = """
@@ -554,7 +568,7 @@ def create_ui():
                 generate_btn = gr.Button("توليد فيديو التوجيه الحركي (Generate Guidance)", elem_id="generate-btn", variant="primary")
 
             with gr.Column(scale=1):
-                gr.Markdown("### الخطوة 3: الفيديو الإرشادي النهائي (خده لمنصة التوليد)", elem_classes=["step-box"])
+                gr.Markdown("### الخطوة 3: الفيديو الإرشادي وصور الفريم الأول", elem_classes=["step-box"])
                 guidance_video = gr.Video(
                     label="Final Guidance Video (Feed as @Video to Omni / Kling)",
                     interactive=False,
@@ -566,19 +580,51 @@ def create_ui():
                     elem_classes=["video-viewport"]
                 )
 
-                gr.Markdown("### الخطوة 4: البرومبت الحتمي الجاهز للنسخ", elem_classes=["step-box"])
-                prompt_text = gr.Textbox(
-                    label="Lean Motion-Transfer Prompt (Copy & Paste to Omni / Seedance / Kling)",
-                    value="Motion-transfer task. @Video is the single source of truth for everything that happens: every expression, lip movement, head turn, hand gesture, body movement, timing, speed, duration, and camera framing. Reproduce @Video frame by frame.\n\nOnly one thing changes: the person. Replace the person in @Video with the character in @Image. Face, hair, and identity come from @Image only.\n\nDo not invent anything: no new gestures, no extra movements, no added expressions, no changed timing, no new actions or story beats. If something is unclear in @Video, keep it still and neutral.\n\nThe depth colors and face mesh lines in @Video are only a technical motion track showing where the body and mouth are in each frame. Do not show them in the output.",
-                    lines=8,
-                    interactive=False,
-                    elem_classes=["prompt-box"]
-                )
+                gr.Markdown("#### صور الفريم الأول الجاهزة للتنزيل (Frame 0 Assets)")
+                with gr.Row():
+                    frame0_clean_ui = gr.Image(
+                        label="Clean Frame 0 (لموديل الصور)",
+                        interactive=False,
+                    )
+                    frame0_mesh_ui = gr.Image(
+                        label="Mesh Frame 0 (لكسر الفلاتر)",
+                        interactive=False,
+                    )
+
+                gr.Markdown("### الخطوة 4: مسارات العمل والبرومبتات الجاهزة", elem_classes=["step-box"])
+                with gr.Tabs():
+                    with gr.TabItem("المسار المحترف: الفريم الأول المتطابق (Frame-0 Aligned)"):
+                        gr.Markdown("**1. برومبت توليد الصورة البديلة (لموديل الصور Midjourney / Flux / Nano Banana):**")
+                        prompt_img_gen = gr.Textbox(
+                            label="Image Swap Prompt (استبدال الشخصية في نفس اللقطة)",
+                            value="Photorealistic portrait shot matching the exact posture, framing, lighting, and camera angle of the reference frame. Replace the subject with [اسم_أو_وصف_الشخصية_الجديدة], preserving the exact hand placement, physical grip, clothing contours, and authentic room background. Natural skin texture, authentic smartphone camera capture, zero CGI gloss.",
+                            lines=4,
+                            interactive=False,
+                            elem_classes=["prompt-box"]
+                        )
+                        gr.Markdown("**2. برومبت نقل الحركة لموديل الفيديو (Omni / Kling / Seedance):**")
+                        prompt_aligned_video = gr.Textbox(
+                            label="Deterministic Motion Transfer Prompt (الصورة متطابقة مع أول فريم)",
+                            value="Motion-transfer task. @Video is the single immutable source of truth for motion, timing, and camera framing. Reproduce @Video frame by frame starting from @Image as the exact initial state.\n\nOnly one thing changes: the subject identity matches @Image. Ignore all face mesh lines and depth colors; use them strictly as invisible motion tracking vectors.\n\nDo not invent any new gestures or movements. Maintain 1.0X normal speed throughout.",
+                            lines=5,
+                            interactive=False,
+                            elem_classes=["prompt-box"]
+                        )
+
+                    with gr.TabItem("مسار الطوارئ: أي صورة عادية (Arbitrary Image Fallback)"):
+                        gr.Markdown("**برومبت الصورة العادية (لما ترفع صورة بروفايل أو لقطة بزاوية تانية خالص):**")
+                        prompt_arbitrary_video = gr.Textbox(
+                            label="Zero-Assumption Prompt (يقفل التأليف ويعزل زاوية الصورة)",
+                            value="Motion-transfer task. @Video is the single source of truth for everything that happens: every expression, lip movement, head turn, hand gesture, body movement, timing, speed, duration, and camera framing. Reproduce @Video frame by frame.\n\nOnly one thing changes: the person. Replace the person in @Video with the character in @Image. Face, hair, and identity come from @Image only.\n\nIgnore @Image's pose, background, lighting, and framing completely; none of them may appear in the output.\n\nDo not invent anything: no new gestures, no extra movements, no added expressions, no changed timing, no new actions or story beats. If something is unclear in @Video, keep it still and neutral.\n\nThe depth colors and face mesh lines in @Video are only a technical motion track showing where the body and mouth are in each frame. Do not show them in the output.",
+                            lines=8,
+                            interactive=False,
+                            elem_classes=["prompt-box"]
+                        )
 
         generate_btn.click(
             fn=infer_guidance_pipeline,
             inputs=[input_video, pipeline_mode, subject_count, depth_colormap, encoder_choice, target_fps, max_res, max_len],
-            outputs=[guidance_video, depth_preview],
+            outputs=[guidance_video, depth_preview, frame0_clean_ui, frame0_mesh_ui],
         )
 
     return demo

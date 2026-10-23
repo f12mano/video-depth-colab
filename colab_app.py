@@ -99,10 +99,6 @@ def get_sam2_predictor(device: str = "cuda"):
     return sam2_predictor
 
 def save_video_custom(frames, output_video_path, fps=24, is_depths=False, colormap_choice="Inferno (Standard)"):
-    """
-    Renders video to disk with custom colormap support (Inferno, Viridis, or Grayscale).
-    Viridis (Cyan/Green) gives stark contrast against warm/orange studio backdrops.
-    """
     writer = imageio.get_writer(output_video_path, fps=fps, macro_block_size=1, codec='libx264', ffmpeg_params=['-crf', '18'])
     if is_depths:
         is_gray = "grayscale" in colormap_choice.lower()
@@ -132,11 +128,6 @@ def save_video_custom(frames, output_video_path, fps=24, is_depths=False, colorm
     writer.close()
 
 def draw_face_mesh_on_image(detector, orig_rgb_frame: np.ndarray, target_im: Image.Image, timestamp_ms: int, Connections) -> Image.Image:
-    """
-    Crops top 60% vertically across full width (0 to W) to guarantee faces are large
-    enough for MediaPipe detector to lock on reliably, even for duo shots or distant figures.
-    Draws directly back onto target_im using exact scaled coordinates.
-    """
     h, w = orig_rgb_frame.shape[:2]
     ch = int(h * 0.60)
     crop = np.ascontiguousarray(orig_rgb_frame[:ch, :])
@@ -147,16 +138,12 @@ def draw_face_mesh_on_image(detector, orig_rgb_frame: np.ndarray, target_im: Ima
     draw = ImageDraw.Draw(target_im)
     if result.face_landmarks:
         for face in result.face_landmarks:
-            # l.x is normalized across full width W; l.y is normalized across cropped height ch
             pts = [(round(l.x * w), round(l.y * ch)) for l in face]
 
-            # Tesselation Mesh (Cyan)
             for conn in Connections.FACE_LANDMARKS_TESSELATION:
                 draw.line([pts[conn.start], pts[conn.end]], fill=(50, 170, 205), width=1)
-            # Lips Highlight (Warm Orange)
             for conn in Connections.FACE_LANDMARKS_LIPS:
                 draw.line([pts[conn.start], pts[conn.end]], fill=(255, 135, 100), width=2)
-            # Left & Right Eyes (Lime Green)
             for conn in Connections.FACE_LANDMARKS_LEFT_EYE:
                 draw.line([pts[conn.start], pts[conn.end]], fill=(130, 255, 150), width=2)
             for conn in Connections.FACE_LANDMARKS_RIGHT_EYE:
@@ -165,11 +152,6 @@ def draw_face_mesh_on_image(detector, orig_rgb_frame: np.ndarray, target_im: Ima
     return target_im
 
 def run_sam2_video_segmentation(frames_rgb: np.ndarray, num_subjects: int = 1, device: str = "cuda") -> list:
-    """
-    Runs Meta's official SAM 2.1 to isolate subject(s) frame-by-frame.
-    Supports 1 person (centered) or 2 persons (left & right duo).
-    Returns a list of boolean 2D masks (True = Subject, False = Background).
-    """
     predictor = get_sam2_predictor(device=device)
     temp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
     try:
@@ -181,12 +163,11 @@ def run_sam2_video_segmentation(frames_rgb: np.ndarray, num_subjects: int = 1, d
             H, W = frames_rgb[0].shape[:2]
 
             if num_subjects == 1:
-                # 4 Key Points on frame 0 to lock centered subject head, torso, and hands
                 points = np.array([
-                    [int(W * 0.50), int(H * 0.30)],  # Face/chin area
-                    [int(W * 0.50), int(H * 0.65)],  # Center money/torso
-                    [int(W * 0.35), int(H * 0.70)],  # Left hand / bundle
-                    [int(W * 0.65), int(H * 0.70)],  # Right hand / bundle
+                    [int(W * 0.50), int(H * 0.30)],
+                    [int(W * 0.50), int(H * 0.65)],
+                    [int(W * 0.35), int(H * 0.70)],
+                    [int(W * 0.65), int(H * 0.70)],
                 ], dtype=np.float32)
                 labels = np.array([1, 1, 1, 1], dtype=np.int32)
                 predictor.add_new_points_or_box(
@@ -197,14 +178,12 @@ def run_sam2_video_segmentation(frames_rgb: np.ndarray, num_subjects: int = 1, d
                     labels=labels,
                 )
             else:
-                # 2 Persons Duo: Person 1 (Left), Person 2 (Right), with negative points on the center wall/mic
-                # Subject 1 (Left side): 4 positive points + 1 negative point on center background
                 p1 = np.array([
-                    [int(W * 0.28), int(H * 0.28)],  # Head
-                    [int(W * 0.28), int(H * 0.55)],  # Torso / chest
-                    [int(W * 0.22), int(H * 0.75)],  # Left hip / pants
-                    [int(W * 0.34), int(H * 0.75)],  # Right hip / pants
-                    [int(W * 0.50), int(H * 0.50)],  # NEGATIVE POINT: Center wall/mic
+                    [int(W * 0.28), int(H * 0.28)],
+                    [int(W * 0.28), int(H * 0.55)],
+                    [int(W * 0.22), int(H * 0.75)],
+                    [int(W * 0.34), int(H * 0.75)],
+                    [int(W * 0.50), int(H * 0.50)],
                 ], dtype=np.float32)
                 l1 = np.array([1, 1, 1, 1, 0], dtype=np.int32)
                 predictor.add_new_points_or_box(
@@ -215,13 +194,12 @@ def run_sam2_video_segmentation(frames_rgb: np.ndarray, num_subjects: int = 1, d
                     labels=l1,
                 )
 
-                # Subject 2 (Right side): 4 positive points + 1 negative point on center background
                 p2 = np.array([
-                    [int(W * 0.78), int(H * 0.28)],  # Head
-                    [int(W * 0.78), int(H * 0.55)],  # Torso / chest
-                    [int(W * 0.72), int(H * 0.75)],  # Left hip / pants
-                    [int(W * 0.84), int(H * 0.75)],  # Right hip / pants
-                    [int(W * 0.50), int(H * 0.50)],  # NEGATIVE POINT: Center wall/mic
+                    [int(W * 0.78), int(H * 0.28)],
+                    [int(W * 0.78), int(H * 0.55)],
+                    [int(W * 0.72), int(H * 0.75)],
+                    [int(W * 0.84), int(H * 0.75)],
+                    [int(W * 0.50), int(H * 0.50)],
                 ], dtype=np.float32)
                 l2 = np.array([1, 1, 1, 1, 0], dtype=np.int32)
                 predictor.add_new_points_or_box(
@@ -234,7 +212,6 @@ def run_sam2_video_segmentation(frames_rgb: np.ndarray, num_subjects: int = 1, d
 
             masks = {}
             for frame_idx, obj_ids, video_res_masks in predictor.propagate_in_video(state):
-                # video_res_masks: (num_objs, 1, H, W) -> Combine via logical OR across objects
                 if isinstance(video_res_masks, torch.Tensor):
                     combined_mask = (video_res_masks > 0.0).any(dim=0).cpu().numpy().squeeze()
                 else:
@@ -357,12 +334,12 @@ def get_or_load_model(encoder: str = 'vits', device: str = 'cuda'):
 def infer_guidance_pipeline(
     input_video: str,
     pipeline_mode: str = "Sirio Exact (SAM 2.1 Depth Subject over Real Room + Face Mesh)",
-    subject_count: str = "2 Persons (Duo / Side-by-Side)",
-    depth_colormap: str = "Inferno (Standard)",
+    subject_count: str = "1 Person (Centered)",
+    depth_colormap: str = "Inferno (Standard Warm)",
     encoder_choice: str = 'vits (Small - Fast & Safe for T4)',
     target_fps: int = 24,
     max_res: int = 960,
-    max_len: int = 228,  # Exactly 9.5 seconds @ 24fps
+    max_len: int = 228,
     progress=gr.Progress(track_tqdm=True),
 ):
     if not input_video or not os.path.exists(input_video):
@@ -387,7 +364,6 @@ def infer_guidance_pipeline(
     guidance_video_path = os.path.join(output_dir, f"{base_name}_guidance_preview.mp4")
     depth_only_path = os.path.join(output_dir, f"{base_name}_depth_only.mp4")
 
-    # Mode A: Fast Face Mesh Only
     if pipeline_mode == "Fast (Face Mesh Only)":
         progress(0.4, desc="Tracking facial landmarks & drawing Face Mesh...")
         mesh_frames = apply_face_mesh_overlay(frames, fps=computed_fps, num_faces=4)
@@ -395,7 +371,6 @@ def infer_guidance_pipeline(
         save_video_custom(mesh_frames, guidance_video_path, fps=computed_fps)
         return [guidance_video_path, guidance_video_path]
 
-    # Step 1: Run Depth Model
     progress(0.25, desc=f"Loading {encoder} depth model...")
     model = get_or_load_model(encoder=encoder, device=device)
 
@@ -410,7 +385,6 @@ def infer_guidance_pipeline(
 
     save_video_custom(depths, depth_only_path, fps=out_fps, is_depths=True, colormap_choice=depth_colormap)
 
-    # Free depth model memory to make room for SAM 2
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -421,7 +395,6 @@ def infer_guidance_pipeline(
         save_video_custom(frames, processed_video_path, fps=out_fps)
         return [processed_video_path, depth_only_path]
 
-    # Read rendered depth frames back as RGB arrays
     cap_d = cv2.VideoCapture(depth_only_path)
     depth_frames = []
     while cap_d.isOpened():
@@ -431,7 +404,6 @@ def infer_guidance_pipeline(
     cap_d.release()
     depth_frames_arr = np.stack(depth_frames, axis=0)
 
-    # Mode B: Sirio Exact (SAM 2.1 Video Masking + Depth Subject over Real Background)
     if "Sirio Exact" in pipeline_mode:
         progress(0.65, desc=f"Running Meta SAM 2.1 Tiny to segment {num_subs} subject(s)...")
         masks = run_sam2_video_segmentation(frames, num_subjects=num_subs, device=device)
@@ -443,15 +415,12 @@ def infer_guidance_pipeline(
             if m.shape[:2] != frames[i].shape[:2]:
                 m = cv2.resize(m.astype(np.uint8), (frames[i].shape[1], frames[i].shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
             alpha = m[:, :, None]
-            # Sirio's exact compositing formula: np.where(alpha, depth, original_rgb)
             comp = np.where(alpha, depth_frames_arr[i], frames[i]).astype(np.uint8)
             base_frames.append(comp)
         base_frames_arr = np.stack(base_frames, axis=0)
     else:
-        # Full frame depth as base
         base_frames_arr = depth_frames_arr
 
-    # Step 2: Overlay MediaPipe Face Mesh on top of Composite (Focused Multi-Face Detector)
     progress(0.88, desc="Overlaying MediaPipe Face Mesh landmarks on all detected faces...")
     model_path = ensure_face_landmarker_model()
     BaseOptions = mp.tasks.BaseOptions
@@ -463,7 +432,7 @@ def infer_guidance_pipeline(
     options = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=RunningMode.VIDEO,
-        num_faces=4,  # Detect up to 4 faces concurrently
+        num_faces=4,
         min_face_detection_confidence=0.15,
         min_face_presence_confidence=0.15,
         min_tracking_confidence=0.15,
@@ -475,8 +444,6 @@ def infer_guidance_pipeline(
             orig_frame = frames[i]
             target_im = Image.fromarray(base_frames_arr[i])
             timestamp_ms = round(i * 1000 / max(out_fps, 1))
-
-            # Draw mesh with top-crop resolution boost
             draw_face_mesh_on_image(detector, orig_frame, target_im, timestamp_ms, Connections)
             final_frames.append(np.array(target_im))
 
@@ -491,23 +458,57 @@ def infer_guidance_pipeline(
 
 def create_ui():
     custom_css = """
-    #title-container { text-align: center; margin-bottom: 1rem; }
-    #generate-btn { background: #2563eb !important; color: white !important; font-size: 1.1rem; }
+    #title-container { text-align: center; margin-bottom: 1.5rem; }
+    #generate-btn { background: #2563eb !important; color: white !important; font-size: 1.15rem; font-weight: bold; border-radius: 8px; }
+    .video-viewport {
+        max-width: 440px !important;
+        margin: 0 auto !important;
+    }
+    .video-viewport video {
+        max-height: 520px !important;
+        object-fit: contain !important;
+        border-radius: 8px !important;
+    }
+    .step-box {
+        border-left: 3px solid #2563eb;
+        padding-left: 0.8rem;
+        margin-bottom: 1rem;
+    }
+    .prompt-box {
+        font-family: monospace;
+        font-size: 0.9rem;
+    }
     """
 
     with gr.Blocks(title="Genjutsu Studio (SAM 2.1 + VDA + Mesh)", css=custom_css, analytics_enabled=False) as demo:
         with gr.Column(elem_id="title-container"):
             gr.Markdown(
                 """
-                # 🎭 Genjutsu Guidance Studio — Meta SAM 2.1 Edition
-                ### Deterministic Subject Segmentation + Consistent Depth + MediaPipe Face Mesh
-                Exact reproduction of Sirio Berati's Genjutsu pipeline (Zero Cloud Cost).
+                # 🎭 Genjutsu Guidance Studio — One-Click Video Guidance
+                ### Plug & Play Video-to-Video Subject Replacement Pipeline
+                Fuses Meta SAM 2.1 + ByteDance VDA + MediaPipe into a single deterministic guidance MP4.
                 """
             )
 
         with gr.Row():
             with gr.Column(scale=1):
-                input_video = gr.Video(label="Input Source Video (e.g. Woman or Duo Video)", sources=["upload"])
+                gr.Markdown("### الخطوة 1: ارفع فيديو المصدر الحركي", elem_classes=["step-box"])
+                input_video = gr.Video(
+                    label="Input Source Video (9:16 or Portrait)",
+                    sources=["upload"],
+                    elem_classes=["video-viewport"]
+                )
+
+                gr.Markdown("### الخطوة 2: اختار نوع المشهد والمعالجة", elem_classes=["step-box"])
+                subject_count = gr.Radio(
+                    choices=[
+                        "1 Person (Centered)",
+                        "2 Persons (Duo / Side-by-Side)"
+                    ],
+                    value="1 Person (Centered)",
+                    label="عدد الأشخاص في الكادر",
+                    info="اختار 2 Persons لو الكليب فيه شخصين جنب بعض عشان يقفل عزل الاتنين سوا.",
+                )
 
                 pipeline_mode = gr.Radio(
                     choices=[
@@ -517,55 +518,62 @@ def create_ui():
                         "Raw Depth Map Only"
                     ],
                     value="Sirio Exact (SAM 2.1 Depth Subject over Real Room + Face Mesh)",
-                    label="Guidance Pipeline Mode",
-                    info="Sirio Exact isolates the subject/money via SAM 2.1 over the real bedroom background.",
+                    label="مود المعالجة التوجيهية",
+                    info="Sirio Exact هو المود الحتمي لعزل الجسم والفلوس فوق خلفية الغرفة الطبيعية.",
                 )
 
-                subject_count = gr.Radio(
-                    choices=[
-                        "1 Person (Centered)",
-                        "2 Persons (Duo / Side-by-Side)"
-                    ],
-                    value="2 Persons (Duo / Side-by-Side)",
-                    label="Number of People / Subjects",
-                    info="Choose '2 Persons' if the clip features two people side-by-side so SAM 2 and Face Mesh lock onto both simultaneously.",
-                )
-
-                depth_colormap = gr.Radio(
-                    choices=[
-                        "Inferno (Standard Warm)",
-                        "Viridis (Cyan/Green - High Contrast for Orange Studios)",
-                        "Grayscale (Black & White)"
-                    ],
-                    value="Inferno (Standard Warm)",
-                    label="Depth Colormap Palette",
-                    info="If the original video background is already orange/red, switch to 'Viridis' or 'Grayscale' so the depth stands out clearly.",
-                )
-
-                with gr.Accordion("Advanced Model & Duration Controls", open=True):
+                with gr.Accordion("إعدادات متقدمة وألوان العمق", open=False):
+                    depth_colormap = gr.Radio(
+                        choices=[
+                            "Inferno (Standard Warm)",
+                            "Viridis (Cyan/Green - High Contrast for Orange Studios)",
+                            "Grayscale (Black & White)"
+                        ],
+                        value="Inferno (Standard Warm)",
+                        label="باليتة ألوان الـ Depth",
+                        info="لو خلفية الاستوديو برتقالية فاقعة، اختار Viridis عشان الموديل يميز التباين.",
+                    )
                     max_len = gr.Slider(
                         minimum=24, maximum=500, value=228, step=12,
-                        label="Frames to Process (228 frames = Exactly 9.5s @ 24fps)",
+                        label="عدد الفريمات (228 فريم = 9.5 ثواني بالضبط @ 24fps)",
                     )
                     target_fps = gr.Slider(
                         minimum=12, maximum=30, value=24, step=1,
-                        label="Target FPS (24fps is standard for Omni / Seedance)",
+                        label="معدل الفريمات Target FPS",
                     )
                     max_res = gr.Slider(
                         minimum=480, maximum=1280, value=960, step=32,
-                        label="Max Side Resolution (960p recommended)",
+                        label="أقصى دقة للعرض Max Side Resolution",
                     )
                     encoder_choice = gr.Radio(
                         choices=["vits (Small - Fast & Safe for T4)", "vitl (Large - High Precision)"],
                         value="vits (Small - Fast & Safe for T4)",
-                        label="Depth Model Size",
+                        label="حجم موديل العمق",
                     )
 
-                generate_btn = gr.Button("Generate Guidance Video", elem_id="generate-btn", variant="primary")
+                generate_btn = gr.Button("توليد فيديو التوجيه الحركي (Generate Guidance)", elem_id="generate-btn", variant="primary")
 
             with gr.Column(scale=1):
-                guidance_video = gr.Video(label="Final Guidance Video (Feed this to Omni)", interactive=False)
-                depth_preview = gr.Video(label="Raw Depth Layer Preview", interactive=False)
+                gr.Markdown("### الخطوة 3: الفيديو الإرشادي النهائي (خده لمنصة التوليد)", elem_classes=["step-box"])
+                guidance_video = gr.Video(
+                    label="Final Guidance Video (Feed as @Video to Omni / Kling)",
+                    interactive=False,
+                    elem_classes=["video-viewport"]
+                )
+                depth_preview = gr.Video(
+                    label="معاينة طبقة العمق المجردة",
+                    interactive=False,
+                    elem_classes=["video-viewport"]
+                )
+
+                gr.Markdown("### الخطوة 4: البرومبت الحتمي الجاهز للنسخ", elem_classes=["step-box"])
+                prompt_text = gr.Textbox(
+                    label="Lean Motion-Transfer Prompt (Copy & Paste to Omni / Seedance / Kling)",
+                    value="Motion-transfer task. @Video is the single source of truth for everything that happens: every expression, lip movement, head turn, hand gesture, body movement, timing, speed, duration, and camera framing. Reproduce @Video frame by frame.\n\nOnly one thing changes: the person. Replace the person in @Video with the character in @Image. Face, hair, and identity come from @Image only.\n\nDo not invent anything: no new gestures, no extra movements, no added expressions, no changed timing, no new actions or story beats. If something is unclear in @Video, keep it still and neutral.\n\nThe depth colors and face mesh lines in @Video are only a technical motion track showing where the body and mouth are in each frame. Do not show them in the output.",
+                    lines=8,
+                    interactive=False,
+                    elem_classes=["prompt-box"]
+                )
 
         generate_btn.click(
             fn=infer_guidance_pipeline,
